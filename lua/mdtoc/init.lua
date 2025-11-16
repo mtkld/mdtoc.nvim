@@ -80,6 +80,199 @@ local function get_scratch_buffer()
 	return fixedspace.buf_id
 end
 
+-- -- ─────────────────────────────────────────────────────────────────────────────
+-- Parsers
+-- -- ─────────────────────────────────────────────────────────────────────────────
+function M.exposed_parser(target_lang)
+	log("-- Step 0")
+
+	if not last_active_buf or not vim.api.nvim_buf_is_valid(last_active_buf) then
+		return {}
+	end
+	log("-- Step 1")
+	local ft = vim.bo[last_active_buf].filetype
+
+	-- Bail out if filetype unsupported
+	local supported = { markdown = true, lua = true, bash = true, sh = true, c = true, php = true, javascript = true }
+	if not supported[ft] then
+		return {}
+	end
+
+	log("-- Step 2")
+	-- Safely get parser
+	local ok, parser = pcall(vim.treesitter.get_parser, last_active_buf, ft)
+	if not ok or not parser then
+		return {}
+	end
+
+	log("-- Step 3")
+	parser:parse() -- Explicit parse still required for Neovim 0.11
+
+	--if not parser then
+	--	return {}
+	--end
+
+	log("-- Step 4")
+	--parser:parse() -- Explicit parse required in Neovim 0.11
+	local tree = parser:parse()[1]
+	if not tree then
+		return {}
+	end
+
+	log("-- Step 5")
+	local root = tree:root()
+	toc_headings = {} -- global table
+
+	if target_lang == "javascript" then
+		log("-- Step 6")
+		local x = parse_javascript(ft, tree, root, true)
+		log("x: " .. vim.inspect(x))
+		return x
+	end
+	return nil -- Unsupported filetype
+end
+function parse_javascript(ft, tree, root, return_entry)
+	return_entry = return_entry or false
+
+	local headings = {}
+	--------------------------------------------------------------------
+	-- JavaScript: function declarations, const foo = () => {}, obj.f = …
+	--------------------------------------------------------------------
+	local query_str = [[
+  ;; --- function foo() {} -------------------------------------------
+  (function_declaration
+    name: (identifier) @func_name
+  ) @func
+
+  ;; --- const foo = function() {} OR const foo = () => {} ------------
+  (lexical_declaration
+    (variable_declarator
+      name: (identifier) @func_name
+      value: [
+        (function_expression)           ;; function () {}
+        (arrow_function)                ;; () => {}
+      ] @func                            ;; << we capture the function itself!
+    )
+  )
+
+  ;; --- obj.foo = function() {} --------------------------------------
+  (expression_statement
+    (assignment_expression
+      left: (member_expression
+        object: (identifier)  @table_name
+        property: (property_identifier) @field_name
+      )
+      right: (function_expression) @func
+    )
+  )
+
+  ;; --- method inside object literal ---------------------------------
+  (pair
+    key: (property_identifier) @field_name
+    value: (function_expression) @func
+  )
+
+  ;; --- class Foo { bar() {} } ---------------------------------------
+  (method_definition
+    name: (property_identifier) @field_name
+  ) @func
+  ]]
+
+	local query = vim.treesitter.query.parse("javascript", query_str)
+	local function_map = {}
+	local seen_functions = {}
+	local entry_map_for_return = {}
+	for _, match, _ in iter_matches(query, root, last_active_buf, 0, -1) do
+		local func_node, func_name, table_name, field_name = nil, nil, nil, nil
+
+		for id, node in pairs(match) do
+			local cap = query.captures[id]
+			local text = vim.treesitter.get_node_text(node, last_active_buf, { all = true }, "")
+			if cap == "func" then
+				func_node = node
+			elseif cap == "func_name" then
+				func_name = text
+			elseif cap == "table_name" then
+				table_name = text
+			elseif cap == "field_name" then
+				field_name = text
+			end
+		end
+
+		-- skip if we somehow didn’t capture a real node
+		if not (type(func_node) == "userdata" and func_node.range) then
+			goto continue
+		end
+
+		local ok, start_row, _, end_row, _ = pcall(function()
+			return func_node:range()
+		end)
+		if not ok then
+			goto continue
+		end -- malformed capture, skip
+
+		-- build display name
+		local display_name = func_name or (field_name or "")
+		if table_name and field_name then
+			display_name = table_name .. "." .. field_name
+		end
+		if display_name == "" then
+			display_name = "anonymous_func"
+		end
+
+		local key = display_name .. ":" .. start_row
+		if not seen_functions[key] then
+			seen_functions[key] = true
+
+			-- figure out nesting level
+			local level = 1
+			local parent_row = nil
+			local parent = func_node:parent()
+			while parent do
+				local t = parent:type()
+				if
+					t == "function"
+					or t == "function_declaration"
+					or t == "function_expression"
+					or t == "arrow_function"
+				then
+					parent_row = parent:start()
+					break
+				end
+				parent = parent:parent()
+			end
+			if parent_row and function_map[parent_row] then
+				level = function_map[parent_row].level + 1
+			end
+
+			local entry = {
+				text = display_name,
+				name = display_name, -- because other parts (funview) relies on name instead
+				level = level,
+				line = start_row,
+				start_line = start_row,
+				end_line = end_row,
+			}
+
+			function_map[start_row] = entry
+			if return_entry then
+				-- If we need to return the entry for funview or similar
+				table.insert(entry_map_for_return, entry)
+			end
+			table.insert(toc_headings, entry)
+			table.insert(headings, string.rep("  ", level - 1) .. "- " .. display_name)
+
+			-- What funview would build (this func we make here is meant to support that)
+			--table.insert(functions, { name = func_name, line = start_row + 1 }) -- Store function name and line
+		end
+		::continue::
+	end
+	if return_entry then
+		return entry_map_for_return
+	end
+	return headings
+end
+
 -- ─────────────────────────────────────────────────────────────────────────────
 -- Treesitter: parse the main buffer (markdown/lua) to find headings
 -- ─────────────────────────────────────────────────────────────────────────────
@@ -91,7 +284,7 @@ local function extract_headings()
 	local ft = vim.bo[last_active_buf].filetype
 
 	-- Bail out if filetype unsupported
-	local supported = { markdown = true, lua = true, bash = true, sh = true, c = true, php = true }
+	local supported = { markdown = true, lua = true, bash = true, sh = true, c = true, php = true, javascript = true }
 	if not supported[ft] then
 		return {}
 	end
@@ -107,7 +300,7 @@ local function extract_headings()
 	if not parser then
 		return {}
 	end
-	parser:parse() -- Explicit parse required in Neovim 0.11
+	--parser:parse() -- Explicit parse required in Neovim 0.11
 	local tree = parser:parse()[1]
 	if not tree then
 		return {}
@@ -450,6 +643,8 @@ local function extract_headings()
 				end
 			end
 		end
+	elseif ft == "javascript" then
+		headings = parse_javascript(ft, tree, root)
 	elseif ft == "lua" then
 		----------------------------------------------------------------------
 		-- For Lua, capture function definitions
@@ -664,8 +859,35 @@ function M.update_scratch_buffer()
 	-- Re-extract headings from the main buffer
 	local headings = extract_headings()
 
-	-- Place them in the TOC buffer
-	vim.api.nvim_buf_set_lines(buf, 0, -1, false, headings)
+	headings = headings or { "[No headings found]" }
+
+	-- We need to clean the headings because there can be newlines in them for some reason
+	local cleaned_lines = {}
+
+	if type(headings) == "table" then
+		for _, line in ipairs(headings) do
+			if type(line) == "string" then
+				-- Strip all newline characters and trim spaces
+				local cleaned = line:gsub("[\r\n]", ""):match("^[^\r\n]*")
+				if cleaned and cleaned ~= "" then
+					table.insert(cleaned_lines, cleaned)
+				end
+			end
+		end
+	elseif type(headings) == "string" then
+		local cleaned = headings:gsub("[\r\n]", ""):match("^[^\r\n]*")
+		if cleaned and cleaned ~= "" then
+			table.insert(cleaned_lines, cleaned)
+		end
+	end
+
+	-- Fallback if all entries were blank or invalid
+	if vim.tbl_isempty(cleaned_lines) then
+		cleaned_lines = { "[No headings found]" }
+	end
+
+	-- Pass full sanitized table
+	vim.api.nvim_buf_set_lines(buf, 0, -1, false, cleaned_lines)
 
 	-- Defer highlight (tiny delay) to avoid flicker if state changes quickly
 	vim.defer_fn(function()
@@ -946,7 +1168,10 @@ local function update_statusline_text()
 
 	-- Temporarily enable modifications
 	vim.bo[statusline_buf].modifiable = true
-	vim.api.nvim_buf_set_lines(statusline_buf, 0, -1, false, { file_path, "  " .. heading_text })
+	-- The cutting because of: Error: replacement string' item contains newlines
+	--local first_line = heading_text:match("^[^\n]*") or ""
+	local first_line = heading_text:gsub("[\r\n]", ""):match("^[^\n\r]*") or ""
+	vim.api.nvim_buf_set_lines(statusline_buf, 0, -1, false, { file_path, "  " .. first_line })
 	vim.bo[statusline_buf].modifiable = false -- Lock buffer again
 
 	-- Apply highlights correctly
@@ -2547,4 +2772,5 @@ function M.ask_ai_and_replace_selection()
 		})
 	end)
 end
+
 return M
